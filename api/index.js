@@ -1,12 +1,18 @@
 // Вебхук навыка Яндекс Алисы: Gemini отвечает, Serper ищет в интернете.
 // Работает на Vercel как serverless-функция по адресу /api.
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 const SERPER_URL = "https://google.serper.dev/search";
 
+// Необязательно: уровень «размышлений» моделей Gemini 3 (minimal, low, medium, high).
+// Если переменная не задана, используется настройка модели по умолчанию.
+const THINKING_LEVEL = process.env.GEMINI_THINKING_LEVEL || "";
+// Если DEBUG=1, текст ошибки произносится в ответе (для отладки).
+const DEBUG = process.env.DEBUG === "1";
+
 // Алиса ждёт ответ не дольше 3 секунд, поэтому оставляем запас.
-const TOTAL_TIMEOUT_MS = 2700;
+const TOTAL_TIMEOUT_MS = 2800;
 const MAX_TEXT = 1000; // лимит Алисы на response.text — 1024 символа
 const MAX_STATE_BYTES = 900; // лимит Алисы на размер состояния — около 1 КБ
 
@@ -84,6 +90,9 @@ async function serperSearch(query, signal) {
 }
 
 async function gemini(contents, signal) {
+  const generationConfig = { maxOutputTokens: 400, temperature: 0.7 };
+  if (THINKING_LEVEL) generationConfig.thinkingConfig = { thinkingLevel: THINKING_LEVEL };
+
   const res = await fetch(GEMINI_URL, {
     method: "POST",
     headers: {
@@ -94,15 +103,16 @@ async function gemini(contents, signal) {
       systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
       contents,
       tools: TOOLS,
-      generationConfig: {
-        maxOutputTokens: 400,
-        temperature: 0.7,
-        thinkingConfig: { thinkingBudget: 0 }, // быстрее отвечает
-      },
+      generationConfig,
     }),
     signal,
   });
-  if (!res.ok) throw new Error(`Gemini ${res.status}`);
+  if (!res.ok) {
+    // Текст ошибки от Google помогает понять причину (виден в логах Vercel).
+    let detail = "";
+    try { detail = (await res.text()).slice(0, 300); } catch {}
+    throw new Error(`Gemini ${res.status}: ${detail}`);
+  }
   const data = await res.json();
   const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
   return parts;
@@ -126,15 +136,17 @@ async function answer(history, utterance, signal) {
     } catch (e) {
       result = "Поиск сейчас недоступен.";
     }
-    contents.push({ role: "model", parts: [{ functionCall: call.functionCall }] });
+    // Возвращаем ответ модели целиком (вместе с thoughtSignature): модели Gemini 3 это требуют.
+    contents.push({ role: "model", parts });
     contents.push({
       role: "user",
-      parts: [{ functionResponse: { name: "web_search", response: { result } } }],
+      parts: [{ functionResponse: { name: call.functionCall.name || "web_search", response: { result } } }],
     });
     parts = await gemini(contents, signal);
   }
 
-  const text = parts.map((p) => p.text || "").join("").trim();
+  // Берём только обычный текст, без служебных «мыслей».
+  const text = parts.filter((p) => p.text && !p.thought).map((p) => p.text).join("").trim();
   return text || "Не нашла, что ответить. Спросите по-другому.";
 }
 
@@ -191,12 +203,14 @@ module.exports = async (req, res) => {
     res.status(200).json(reply(text, { state: packHistory(newHistory) }));
   } catch (e) {
     const timedOut = e && e.name === "AbortError";
-    const msg = timedOut
+    console.error("webhook error:", e && e.message);
+    let msg = timedOut
       ? "Я не успела найти ответ. Спросите ещё раз, пожалуйста."
       : "Произошла ошибка. Попробуйте ещё раз.";
-    console.error("webhook error:", e && e.message);
+    if (DEBUG) msg = `Ошибка: ${(e && e.message) || "неизвестно"}`;
     res.status(200).json(reply(msg, { state: packHistory(history) }));
   } finally {
     clearTimeout(timer);
   }
 };
+
