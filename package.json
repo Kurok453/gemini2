@@ -1,0 +1,10 @@
+{
+  "name": "alice-gemini-webhook",
+  "version": "1.0.0",
+  "description": "Вебхук навыка Яндекс Алисы на Gemini и Serper для Vercel",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}
